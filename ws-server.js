@@ -6,7 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
-const PORT = process.env.WS_PORT || 30021; // kalau mau balik ke 3001 juga boleh
+const PORT = process.env.WS_PORT || 3001; // kalau mau balik ke 3001 juga boleh
 
 // ------ STATUS & CLIENTS ------
 

@@ -22,18 +22,17 @@ function NoSSR({ children }) {
   return mounted ? children : null;
 }
 
-function MyApp({ Component, pageProps }) {
+function MyApp({ Component, pageProps: { session, ...pageProps } }) {
   return (
-    <>
+    <SessionProvider session={session}>
       <Head>
         <title>Admin Panel - Chatbot Pendaftaran Sekolah</title>
         <meta
           name="description"
           content="Dashboard admin untuk mengelola chatbot pendaftaran sekolah"
         />
-        <link rel="icon" href="/favicon.ico" />
+        <link rel="icon" href="/icons/favicon.ico" />
       </Head>
-
       <NoSSR>
         <Component {...pageProps} />
         <ToastContainer
@@ -49,7 +48,7 @@ function MyApp({ Component, pageProps }) {
           theme="light"
         />
       </NoSSR>
-    </>
+    </SessionProvider>
   );
 }
 

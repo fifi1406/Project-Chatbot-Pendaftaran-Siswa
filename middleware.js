@@ -17,11 +17,11 @@ export async function middleware(req) {
   const session = await getToken({ req, secret: process.env.NEXTAUTH_SECRET });
 
   // Redirect to login if not authenticated
-  if (!session) {
-    const url = new URL('/auth/login', req.url);
-    url.searchParams.set('callbackUrl', req.url);
-    return NextResponse.redirect(url);
-  }
+  // if (!session) {
+  //   const url = new URL('/auth/login', req.url);
+  //   url.searchParams.set('callbackUrl', req.url);
+  //   return NextResponse.redirect(url);
+  // }
 
   return NextResponse.next();
 }
