@@ -8,7 +8,10 @@ import makeWASocket, {
 import qrcode from "qrcode-terminal";
 import axios from "axios";
 import { getIntent } from "../lib/nlp.js";
-import { loadKnowledgeBase, answerDenganGemini } from "./rag.js";
+import { loadKnowledgeBase, answerDenganGemini } from "./rag-groq.js";
+import { handleMessageWithAI, setKnowledgeBase } from "./message-handler-ai.js";
+import { isCancelIntent, isContinueIntent } from "./intent-detector.js";
+import { saveMessage, isReturningUser, getLastConversationTime, formatConversationForAI } from "./conversation-memory.js";
 import { WebSocketServer } from 'ws';
 import http from 'http';
 import fs from 'fs';
@@ -75,6 +78,62 @@ let currentQR = null;
 
 // Menyimpan state setiap pengguna
 const userState = {};
+
+// ========== RATE LIMITING UNTUK AI CALLS ==========
+const aiCallTracker = {
+  calls: [],
+  maxCallsPerMinute: 20, // Maksimal 20 AI calls per menit
+  maxCallsPerHour: 200,  // Maksimal 200 AI calls per jam
+  
+  // Cek apakah bisa melakukan AI call
+  canMakeCall() {
+    const now = Date.now();
+    const oneMinuteAgo = now - 60 * 1000;
+    const oneHourAgo = now - 60 * 60 * 1000;
+    
+    // Bersihkan calls yang sudah lebih dari 1 jam
+    this.calls = this.calls.filter(time => time > oneHourAgo);
+    
+    // Hitung calls dalam 1 menit terakhir
+    const callsLastMinute = this.calls.filter(time => time > oneMinuteAgo).length;
+    
+    // Hitung calls dalam 1 jam terakhir
+    const callsLastHour = this.calls.length;
+    
+    // Log untuk monitoring
+    if (callsLastMinute > this.maxCallsPerMinute * 0.8) {
+      console.log(`⚠️  Rate limit warning: ${callsLastMinute}/${this.maxCallsPerMinute} calls per minute`);
+    }
+    
+    if (callsLastHour > this.maxCallsPerHour * 0.8) {
+      console.log(`⚠️  Rate limit warning: ${callsLastHour}/${this.maxCallsPerHour} calls per hour`);
+    }
+    
+    return callsLastMinute < this.maxCallsPerMinute && callsLastHour < this.maxCallsPerHour;
+  },
+  
+  // Catat AI call
+  recordCall() {
+    this.calls.push(Date.now());
+  },
+  
+  // Get stats
+  getStats() {
+    const now = Date.now();
+    const oneMinuteAgo = now - 60 * 1000;
+    const oneHourAgo = now - 60 * 60 * 1000;
+    
+    const callsLastMinute = this.calls.filter(time => time > oneMinuteAgo).length;
+    const callsLastHour = this.calls.filter(time => time > oneHourAgo).length;
+    
+    return {
+      callsLastMinute,
+      callsLastHour,
+      maxCallsPerMinute: this.maxCallsPerMinute,
+      maxCallsPerHour: this.maxCallsPerHour
+    };
+  }
+};
 
 // Simpan status terakhir
 let currentStatus = {
@@ -214,10 +273,23 @@ async function startBot() {
   sock.ev.on("messages.upsert", async ({ messages }) => {
     try {
       const msg = messages[0];
+        
+      // Cek pesan yang tidak valid
       if (!msg?.message) return;
-
-      // abaikan pesan dari diri sendiri
+      
+      // Abaikan pesan dari diri sendiri
       if (msg.key.fromMe) return;
+      
+      // Blokir pesan dari grup
+      if (msg.key.remoteJid.endsWith('@g.us')) {
+          console.log('Pesan dari grup diabaikan:', msg.key.remoteJid);
+          return;
+      }
+
+      // Blokir pesan dari broadcast/status
+      if (msg.key.remoteJid === 'status@broadcast') {
+          return;
+      }
 
       const sender = msg.key.remoteJid;
 
@@ -231,9 +303,89 @@ async function startBot() {
 
       const rawText = text.trim();
       const lowerText = rawText.toLowerCase();
-      if (!rawText) return;
+      
+      // Handle pesan kosong atau hanya emoji/sticker
+      if (!rawText) {
+        // Jika user kirim media tanpa caption dan sedang dalam proses pendaftaran
+        if (userState[sender]?.step) {
+          return sock.sendMessage(sender, {
+            text: '⚠️ Mohon kirim pesan teks ya buat lanjutin pendaftaran.\n\n' +
+                  '💡 Ketik *lanjut* untuk lihat pertanyaan saat ini\n' +
+                  '💡 Ketik *batal* untuk batalkan pendaftaran'
+          });
+        }
+        return; // Abaikan pesan kosong
+      }
+
+      // Filter spam (pesan terlalu panjang)
+      if (rawText.length > 500 && userState[sender]?.step) {
+        return sock.sendMessage(sender, {
+          text: '⚠️ Wah, pesannya kepanjangan nih. Bisa disingkat gak? (maksimal 500 karakter ya) 😅'
+        });
+      }
 
       console.log(`📩 Pesan dari ${sender}:`, rawText);
+      
+      // ========== CONVERSATION MEMORY ==========
+      // Save user message
+      saveMessage(sender, 'user', rawText, {
+        messageType: msg.message.conversation ? 'text' : 'media',
+        hasCaption: !!(msg.message.imageMessage?.caption || msg.message.videoMessage?.caption)
+      });
+      
+      // Check if returning user
+      if (isReturningUser(sender)) {
+        const lastTime = getLastConversationTime(sender);
+        console.log(`👤 Returning user - Last conversation: ${lastTime}`);
+      } else {
+        console.log(`🆕 New user - First conversation`);
+      }
+
+      // ========== RATE LIMITING ==========
+      // Cegah spam dengan membatasi pesan per user
+      if (!userState[sender]) {
+        userState[sender] = {};
+      }
+      
+      const now = Date.now();
+      const lastMessageTime = userState[sender].lastMessageTime || 0;
+      const timeDiff = now - lastMessageTime;
+      
+      // Jika user kirim pesan < 1 detik dari pesan sebelumnya, abaikan
+      if (timeDiff < 1000 && userState[sender].step) {
+        console.log(`⚠️ Rate limit: ${sender} kirim pesan terlalu cepat`);
+        return;
+      }
+      
+      userState[sender].lastMessageTime = now;
+      
+      // ========== GLOBAL AI RATE LIMITING ==========
+      // Cek apakah bisa melakukan AI call
+      const canUseAI = aiCallTracker.canMakeCall();
+      
+      if (!canUseAI) {
+        console.log('⚠️  AI rate limit reached, using fallback system only');
+        
+        // Jika rate limit, langsung gunakan fallback tanpa AI
+        // (sistem fallback tetap bisa handle dengan baik)
+      }
+
+      // ========== SESSION TIMEOUT ==========
+      // Jika user tidak aktif > 30 menit, reset session
+      if (userState[sender]?.step && userState[sender].lastMessageTime) {
+        const inactiveTime = now - userState[sender].lastMessageTime;
+        const TIMEOUT = 30 * 60 * 1000; // 30 menit
+        
+        if (inactiveTime > TIMEOUT) {
+          delete userState[sender];
+          return sock.sendMessage(sender, {
+            text: '⏰ *Sesi Pendaftaran Berakhir*\n\n' +
+                  'Maaf ya, sesi pendaftaran kamu udah timeout karena gak aktif lebih dari 30 menit 😅\n\n' +
+                  '💡 Ketik *Daftar* kalau mau mulai lagi ya!\n\n' +
+                  'Ada yang bisa aku bantu? 🙌'
+          });
+        }
+      }
 
       // ========== FLOW PENDAFTARAN ==========
       
@@ -260,25 +412,166 @@ async function startBot() {
       // Fungsi untuk menampilkan menu bantuan
       const showHelpMenu = async (sender) => {
         await sock.sendMessage(sender, {
-          text: `📋 *Menu Bantuan Pendaftaran*\n\n` +
-            `Berikut perintah yang tersedia:\n` +
-            `• *Daftar* - Memulai proses pendaftaran\n` +
-            `• *Batal* - Membatalkan pendaftaran\n` +
-            `• *Status* - Melihat status pendaftaran\n` +
-            `• *Bantuan* - Menampilkan menu bantuan`
+          text: `📋 *Menu Bantuan*\n\n` +
+            `Ini perintah yang bisa kamu pakai:\n` +
+            `• *Daftar* - Mulai proses pendaftaran\n` +
+            `• *Batal* - Batalkan pendaftaran\n` +
+            `• *Status* - Lihat status pendaftaran\n` +
+            `• *Bantuan* - Tampilkan menu ini\n\n` +
+            `Atau kamu bisa langsung tanya apa aja soal SMK Globin! 😊`
         });
       };
+
+      // ========== AI-POWERED MESSAGE HANDLER ==========
+      console.log('\n🤖 Processing message with AI system...');
+      
+      // Cek rate limit sebelum panggil AI
+      let useAI = canUseAI;
+      
+      if (!useAI) {
+        console.log('⚠️  Skipping AI, using fallback system');
+      }
+      
+      const aiResult = await handleMessageWithAI(
+        rawText,
+        userState[sender],
+        sock,
+        sender,
+        useAI // Pass flag apakah boleh gunakan AI
+      );
+      
+      // Jika AI digunakan, catat call
+      if (useAI && aiResult.aiUsed) {
+        aiCallTracker.recordCall();
+        
+        // Log stats setiap 10 calls
+        if (aiCallTracker.calls.length % 10 === 0) {
+          const stats = aiCallTracker.getStats();
+          console.log(`📊 AI Usage Stats: ${stats.callsLastMinute}/${stats.maxCallsPerMinute} per min, ${stats.callsLastHour}/${stats.maxCallsPerHour} per hour`);
+        }
+      }
+      
+      // Jika AI sudah handle pesan
+      if (aiResult.handled) {
+        console.log('✅ Message handled by AI system');
+        
+        // Execute action jika ada
+        if (aiResult.action) {
+          const response = await aiResult.action();
+          
+          // Save bot response (extract dari action jika ada)
+          if (aiResult.responseText) {
+            saveMessage(sender, 'bot', aiResult.responseText, {
+              intent: aiResult.intent,
+              aiUsed: aiResult.aiUsed
+            });
+          }
+        }
+        
+        // Jika perlu start registration
+        if (aiResult.shouldStartRegistration) {
+          userState[sender] = {
+            step: 1,
+            status_pendaftaran: 'pending',
+            tanggal_daftar: new Date().toISOString()
+          };
+        }
+        
+        return; // Stop processing
+      }
+      
+      // Jika AI bilang lanjutkan ke form processing
+      if (aiResult.shouldContinueToForm) {
+        console.log('➡️  Continuing to form processing...');
+        // Lanjutkan ke form processing di bawah
+      }
+      
+      // ========== FALLBACK: OLD HANDLERS (jika AI gagal) ==========
 
       // Handle perintah bantuan
       if (lowerText === 'bantuan' || lowerText === 'help') {
         return showHelpMenu(sender);
       }
 
-      // Handle pembatalan
-      if (lowerText === 'batal' && userState[sender]?.step) {
+      // ========== HANDLING PERTANYAAN DI TENGAH PENDAFTARAN ==========
+      // Jika user sedang dalam proses pendaftaran tapi bertanya sesuatu
+      if (userState[sender]?.step && !isCancelIntent && !isContinueIntent) {
+        // Cek apakah ini pertanyaan (bukan jawaban untuk form)
+        const questionKeywords = [
+          'apa', 'bagaimana', 'kapan', 'dimana', 'berapa', 'siapa', 
+          'kenapa', 'mengapa', 'biaya', 'syarat', 'jadwal', 'jurusan',
+          'ekstrakurikuler', 'fasilitas', 'kontak', 'alamat', 'info',
+          'bisa', 'boleh', 'ada', 'gimana', 'gmn', 'gmana'
+        ];
+        
+        const isQuestion = questionKeywords.some(kw => lowerText.includes(kw)) || 
+                          lowerText.includes('?') ||
+                          lowerText.startsWith('mau tanya') ||
+                          lowerText.startsWith('tanya') ||
+                          lowerText.startsWith('info');
+        
+        // Jangan treat jawaban singkat sebagai pertanyaan
+        const isShortAnswer = rawText.length < 50 && !lowerText.includes('?');
+        
+        if (isQuestion && !isShortAnswer) {
+          // Simpan step sementara
+          const currentStep = userState[sender].step;
+          
+          // Jawab pertanyaan dengan AI
+          const answer = await answerDenganGemini(rawText);
+          
+          await sock.sendMessage(sender, {
+            text: answer + '\n\n' +
+                  '━━━━━━━━━━━━━━━━━━━━\n' +
+                  '📝 *Eh iya, kamu masih dalam proses pendaftaran nih!*\n\n' +
+                  `Kamu lagi di step ${currentStep}.\n\n` +
+                  '💡 Mau gimana nih?\n' +
+                  '• Ketik *lanjut* kalau mau lanjutin daftar\n' +
+                  '• Ketik *batal* kalau mau berhenti dulu\n' +
+                  '• Atau tanya lagi kalau masih ada yang pengen ditanyain 😊'
+          });
+          
+          return; // Jangan lanjut ke step berikutnya
+        }
+      }
+
+      // Handle pembatalan dengan FUZZY MATCHING (deteksi typo & variasi)
+      if (isCancelIntent(rawText) && userState[sender]?.step) {
         delete userState[sender];
         return sock.sendMessage(sender, {
-          text: '❌ Pendaftaran dibatalkan. Ketik *Daftar* untuk memulai kembali.'
+          text: '❌ *Pendaftaran Dibatalkan*\n\n' +
+                'Oke deh, gak papa kok! Kamu bisa daftar kapan aja kalau udah siap 😊\n\n' +
+                '💡 Ketik *Daftar* kalau mau mulai lagi\n' +
+                '💡 Ketik *Bantuan* kalau butuh bantuan\n\n' +
+                'Ada yang mau aku bantu lagi? 🙌'
+        });
+      }
+
+      // Handle lanjut pendaftaran dengan FUZZY MATCHING
+      if (isContinueIntent(rawText) && userState[sender]?.step) {
+        const step = userState[sender].step;
+        const stepMessages = {
+          1: '📝 Nama lengkap kamu siapa nih? 😊',
+          2: '📧 Email kamu apa?',
+          3: '📱 Nomor HP kamu berapa? (contoh: 081234567890)',
+          4: '🏠 Kamu lahir di mana?',
+          5: '📅 Tanggal lahir kamu kapan? (format: YYYY-MM-DD, contoh: 2005-05-15)',
+          6: '🚻 Jenis kelamin kamu apa? (L/P)',
+          7: '🕌 Agama kamu apa?',
+          8: '🏠 Alamat lengkap kamu di mana?',
+          9: '👨‍👩‍👧‍👦 Nama orang tua kamu siapa?',
+          10: '💼 Orang tua kamu kerja apa?',
+          11: '📱 Nomor HP orang tua kamu berapa? (contoh: 081234567890)',
+          12: '🏫 Kamu sekolah di mana sebelumnya?',
+          13: '🏫 Alamat sekolah kamu yang dulu di mana?',
+          14: '📅 Kamu lulus tahun berapa? (contoh: 2024)',
+          15: '📊 Nilai raport kamu berapa? (contoh: 85.50)',
+          16: '📚 Kamu mau ambil jurusan apa? (contoh: Teknik Komputer Jaringan)'
+        };
+        
+        return sock.sendMessage(sender, {
+          text: '✅ Oke gas! Yuk kita lanjutin pendaftarannya 😊\n\n' + 
+                (stepMessages[step] || 'Lanjut ya...')
         });
       }
 
@@ -291,8 +584,15 @@ async function startBot() {
           tanggal_daftar: new Date().toISOString()
         };
         return sock.sendMessage(sender, {
-          text: '📝 *PENDAFTARAN SISWA BARU*\n\n' +
-            'Silakan masukkan *nama lengkap* Anda:'
+          text: '📝 *PENDAFTARAN SISWA BARU SMK GLOBIN*\n\n' +
+                'Halo! Aku GLOMIN, asisten virtual SMK Globin 😊\n\n' +
+                'Aku bakal bantu kamu daftar ya! Prosesnya gampang kok.\n\n' +
+                '💡 *Tips buat kamu:*\n' +
+                '• Kamu bisa tanya-tanya kapan aja selama proses pendaftaran\n' +
+                '• Ketik *batal* kalau mau berhenti\n' +
+                '• Ketik *lanjut* kalau mau lanjutin lagi\n\n' +
+                '━━━━━━━━━━━━━━━━━━━━\n\n' +
+                'Oke, kita mulai ya! Nama lengkap kamu siapa nih? 😊'
         });
       }
 
@@ -301,7 +601,7 @@ async function startBot() {
         userState[sender].nama = rawText;
         userState[sender].step = 2;
         return sock.sendMessage(sender, {
-          text: '📧 Masukkan *alamat email* Anda:'
+          text: '📧 Oke, sekarang email kamu apa nih?'
         });
       }
 
@@ -309,13 +609,13 @@ async function startBot() {
       if (userState[sender]?.step === 2) {
         if (!isValidEmail(rawText)) {
           return sock.sendMessage(sender, {
-            text: '❌ Format email tidak valid. Mohon masukkan email yang benar:'
+            text: '❌ Wah, emailnya kayaknya belum bener deh. Coba cek lagi ya! 😅'
           });
         }
         userState[sender].email = rawText;
         userState[sender].step = 3;
         return sock.sendMessage(sender, {
-          text: '📱 Masukkan *nomor HP* (contoh: 081234567890):'
+          text: '📱 Nomor HP kamu berapa? (contoh: 081234567890)'
         });
       }
 
@@ -323,14 +623,14 @@ async function startBot() {
       if (userState[sender]?.step === 3) {
         if (!isValidPhone(rawText)) {
           return sock.sendMessage(sender, {
-            text: '❌ Format nomor HP tidak valid. Mohon masukkan nomor yang benar (10-15 digit angka):'
+            text: '❌ Hmm, nomor HP-nya kayaknya belum bener. Coba lagi ya! (10-15 digit angka)'
           });
         }
         userState[sender].nomor = rawText;
         userState[sender].no_hp_ortu = rawText; // Set default nomor ortu sama dengan nomor siswa
         userState[sender].step = 4;
         return sock.sendMessage(sender, {
-          text: '🏠 Masukkan *tempat lahir*:'
+          text: '🏠 Kamu lahir di mana?'
         });
       }
 
@@ -339,7 +639,7 @@ async function startBot() {
         userState[sender].tempat_lahir = rawText;
         userState[sender].step = 5;
         return sock.sendMessage(sender, {
-          text: '📅 Masukkan *tanggal lahir* (format: YYYY-MM-DD, contoh: 2005-05-15):'
+          text: '📅 Tanggal lahir kamu kapan? (format: YYYY-MM-DD, contoh: 2005-05-15)'
         });
       }
 
@@ -347,13 +647,13 @@ async function startBot() {
       if (userState[sender]?.step === 5) {
         if (!isValidDate(rawText)) {
           return sock.sendMessage(sender, {
-            text: '❌ Format tanggal tidak valid. Gunakan format YYYY-MM-DD (contoh: 2005-05-15):'
+            text: '❌ Format tanggalnya belum bener nih. Pakai format YYYY-MM-DD ya (contoh: 2005-05-15)'
           });
         }
         userState[sender].tanggal_lahir = rawText;
         userState[sender].step = 6;
         return sock.sendMessage(sender, {
-          text: '🚻 Masukkan *jenis kelamin* (L/P):'
+          text: '🚻 Jenis kelamin kamu apa? (L/P)'
         });
       }
 
@@ -362,13 +662,13 @@ async function startBot() {
         const jk = rawText.toUpperCase();
         if (jk !== 'L' && jk !== 'P') {
           return sock.sendMessage(sender, {
-            text: '❌ Pilihan tidak valid. Masukkan L untuk Laki-laki atau P untuk Perempuan:'
+            text: '❌ Pilih L (Laki-laki) atau P (Perempuan) ya!'
           });
         }
         userState[sender].jenis_kelamin = jk;
         userState[sender].step = 7;
         return sock.sendMessage(sender, {
-          text: '🕌 Masukkan *agama*:'
+          text: '🕌 Agama kamu apa?'
         });
       }
 
@@ -377,7 +677,7 @@ async function startBot() {
         userState[sender].agama = rawText;
         userState[sender].step = 8;
         return sock.sendMessage(sender, {
-          text: '🏠 Masukkan *alamat lengkap*:'
+          text: '🏠 Alamat lengkap kamu di mana?'
         });
       }
 
@@ -386,7 +686,7 @@ async function startBot() {
         userState[sender].alamat = rawText;
         userState[sender].step = 9;
         return sock.sendMessage(sender, {
-          text: '👨‍👩‍👧‍👦 Masukkan *nama orang tua*:'
+          text: '👨‍👩‍👧‍👦 Nama orang tua kamu siapa?'
         });
       }
 
@@ -395,7 +695,7 @@ async function startBot() {
         userState[sender].nama_ortu = rawText;
         userState[sender].step = 10;
         return sock.sendMessage(sender, {
-          text: '💼 Masukkan *pekerjaan orang tua*:'
+          text: '💼 Orang tua kamu kerja apa?'
         });
       }
 
@@ -404,7 +704,7 @@ async function startBot() {
         userState[sender].pekerjaan_ortu = rawText;
         userState[sender].step = 11;
         return sock.sendMessage(sender, {
-          text: '📱 Masukkan *nomor HP orang tua* (contoh: 081234567890):'
+          text: '📱 Nomor HP orang tua kamu berapa? (contoh: 081234567890)'
         });
       }
 
@@ -412,13 +712,13 @@ async function startBot() {
       if (userState[sender]?.step === 11) {
         if (!isValidPhone(rawText)) {
           return sock.sendMessage(sender, {
-            text: '❌ Format nomor HP tidak valid. Mohon masukkan nomor yang benar (10-15 digit angka):'
+            text: '❌ Nomor HP-nya belum bener nih. Coba lagi ya! (10-15 digit angka)'
           });
         }
         userState[sender].no_hp_ortu = rawText;
         userState[sender].step = 12;
         return sock.sendMessage(sender, {
-          text: '🏫 Masukkan *asal sekolah*:'
+          text: '🏫 Kamu sekolah di mana sebelumnya?'
         });
       }
 
@@ -427,7 +727,7 @@ async function startBot() {
         userState[sender].asal_sekolah = rawText;
         userState[sender].step = 13;
         return sock.sendMessage(sender, {
-          text: '🏫 Masukkan *alamat sekolah asal*:'
+          text: '🏫 Alamat sekolah kamu yang dulu di mana?'
         });
       }
 
@@ -436,7 +736,7 @@ async function startBot() {
         userState[sender].alamat_sekolah_asal = rawText;
         userState[sender].step = 14;
         return sock.sendMessage(sender, {
-          text: '📅 Masukkan *tahun lulus* (contoh: 2024):'
+          text: '📅 Kamu lulus tahun berapa? (contoh: 2024)'
         });
       }
 
@@ -447,14 +747,14 @@ async function startBot() {
         
         if (isNaN(tahun) || tahun < 2000 || tahun > tahunSekarang) {
           return sock.sendMessage(sender, {
-            text: `❌ Tahun tidak valid. Mohon masukkan tahun antara 2000-${tahunSekarang}:`
+            text: `❌ Tahunnya kayaknya belum bener deh. Masukkan tahun antara 2000-${tahunSekarang} ya!`
           });
         }
         
         userState[sender].tahun_lulus = tahun;
         userState[sender].step = 15;
         return sock.sendMessage(sender, {
-          text: '📊 Masukkan *nilai raport* (contoh: 85.50):'
+          text: '📊 Nilai raport kamu berapa? (contoh: 85.50)'
         });
       }
 
@@ -464,14 +764,14 @@ async function startBot() {
         
         if (isNaN(nilai) || nilai < 0 || nilai > 100) {
           return sock.sendMessage(sender, {
-            text: '❌ Nilai tidak valid. Mohon masukkan nilai antara 0-100 (contoh: 85.50):'
+            text: '❌ Nilai harus antara 0-100 ya! (contoh: 85.50)'
           });
         }
         
         userState[sender].nilai_raport = nilai;
         userState[sender].step = 16;
         return sock.sendMessage(sender, {
-          text: '📚 Masukkan *pilihan jurusan 1* (contoh: Teknik Komputer Jaringan):'
+          text: '📚 Kamu mau ambil jurusan apa? (contoh: Teknik Komputer Jaringan)'
         });
       }
 
@@ -480,8 +780,8 @@ async function startBot() {
         userState[sender].pilihan_jurusan1 = rawText;
         userState[sender].step = 17;
         return sock.sendMessage(sender, {
-          text: '📚 Masukkan *pilihan jurusan 2* (opsional, ketik "-" untuk melewatkan):',
-          footer: 'Ketik "-" untuk melewatkan'
+          text: '📚 Ada pilihan jurusan kedua? (ketik "-" kalau gak ada)',
+          footer: 'Ketik "-" untuk skip'
         });
       }
 
@@ -576,9 +876,9 @@ async function startBot() {
               }
             );
             
-            let successMessage = 'Halo, terima kasih telah mendaftar di SMK Globin! 🎉\n\n' +
-              '✅ *PENDAFTARAN ANDA BERHASIL*\n\n' +
-              'Berikut detail pendaftaran Anda:\n' +
+            let successMessage = 'Halo, terima kasih udah daftar di SMK Globin! 🎉\n\n' +
+              '✅ *PENDAFTARAN KAMU BERHASIL!*\n\n' +
+              'Ini detail pendaftaran kamu ya:\n' +
               '┌───────────────────────────┐\n' +
               `│ 👤 *Nama*: ${userState[sender]?.nama || '-'}\n` +
               `│ 📱 *No. HP*: ${userState[sender]?.nomor || '-'}\n` +
@@ -591,17 +891,17 @@ async function startBot() {
             }
 
             successMessage += '└───────────────────────────┘\n\n' +
-              '📌 *INFORMASI SELANJUTNYA*\n' +
-              '1. Admin kami akan menghubungi Anda maksimal 1x24 jam\n' +
+              '📌 *LANGKAH SELANJUTNYA*\n' +
+              '1. Admin kami bakal hubungi kamu maksimal 1x24 jam ya\n' +
               '2. Siapkan dokumen yang diperlukan:\n' +
               '   - Fotokopi KK dan Akta Kelahiran\n' +
               '   - Pas foto 3x4 (2 lembar)\n' +
-              '   - Raport terakhir (jika ada)\n\n' +
-              '3. Tes seleksi akan diinformasikan lebih lanjut\n\n' +
-              '❓ *Pertanyaan lebih lanjut*\n' +
+              '   - Raport terakhir (kalau ada)\n\n' +
+              '3. Nanti bakal ada info tes seleksi juga\n\n' +
+              '❓ *Ada pertanyaan?*\n' +
               '📞 021-12345678 (Admin)\n' +
               '🕒 Senin - Jumat, 08:00 - 16:00 WIB\n\n' +
-              'Terima kasih atas kepercayaan Anda kepada SMK Globin. Kami tunggu kehadiran Anda! 🙏';
+              'Makasih ya udah percaya sama SMK Globin. Ditunggu kedatangannya! 🙏';
 
             // Hapus state sebelum mengirim pesan sukses
             const userData = { ...userState[sender] };
@@ -634,13 +934,13 @@ async function startBot() {
           // Reset state dan beri pesan untuk memulai ulang
           delete userState[sender];
           return sock.sendMessage(sender, {
-            text: 'Baik, data pendaftaran Anda tidak jadi disimpan.\n\n' +
-                  'Jika ingin mendaftar kembali, silakan ketik *Daftar*.'
+            text: 'Oke deh, data pendaftaran kamu gak jadi disimpan ya.\n\n' +
+                  'Kalau mau daftar lagi, tinggal ketik *Daftar* aja! 😊'
           });
         } else {
           console.log('Jawaban tidak valid diterima:', konfirmasi); // Log untuk debugging
           return sock.sendMessage(sender, {
-            text: 'Mohon jawab dengan *Ya* (atau *y*) atau *Tidak* (atau *t*) saja.'
+            text: 'Mohon jawab dengan *Ya* (atau *y*) atau *Tidak* (atau *t*) aja ya! 😊'
           });
         }
       }
@@ -664,19 +964,49 @@ async function startBot() {
         return;
       }
 
-      // ========== SEMUA PERTANYAAN LAIN → GEMINI ==========
+      // ========== SEMUA PERTANYAAN LAIN → GROQ AI ==========
 
       try {
         const jawaban = await answerDenganGemini(rawText);
         await sock.sendMessage(sender, { text: jawaban });
       } catch (e) {
-        console.error("❌ Error memanggil Gemini:", e);
-        await sock.sendMessage(sender, {
-          text: "Maaf, saya sedang tidak bisa mengakses sistem AI.",
-        });
+        console.error("❌ Error memanggil Groq AI:", e);
+        
+        // Error handling yang lebih spesifik
+        let errorMsg = "Maaf nih, aku lagi ada gangguan. 🙏\n\n";
+        
+        if (e.message?.includes('rate limit') || e.message?.includes('429')) {
+          errorMsg += "Sistem lagi sibuk banget. Tunggu sebentar ya, terus coba lagi.\n\n";
+        } else if (e.message?.includes('timeout') || e.message?.includes('ETIMEDOUT')) {
+          errorMsg += "Koneksi timeout. Coba lagi ya!\n\n";
+        } else if (e.message?.includes('API key')) {
+          errorMsg += "Ada masalah dengan sistem nih.\n\n";
+        } else {
+          errorMsg += "Ada error teknis nih.\n\n";
+        }
+        
+        errorMsg += "Kalau urgent, langsung hubungi:\n" +
+                   "📞 (0251) 8422525\n" +
+                   "📱 WA: 0812-1062-2374";
+        
+        await sock.sendMessage(sender, { text: errorMsg });
       }
     } catch (err) {
       console.error("❌ Error di handler messages.upsert:", err);
+      
+      // Jangan crash bot, tapi log error dengan detail
+      console.error("Error stack:", err.stack);
+      
+      // Kirim pesan error ke user jika memungkinkan
+      try {
+        if (msg?.key?.remoteJid) {
+          await sock.sendMessage(msg.key.remoteJid, {
+            text: "⚠️ Maaf, terjadi kesalahan sistem. Silakan coba lagi atau hubungi admin."
+          });
+        }
+      } catch (sendErr) {
+        console.error("❌ Gagal kirim pesan error:", sendErr);
+      }
     }
   });
 }
@@ -699,8 +1029,10 @@ export function getBotStatus() {
 }
 
 loadKnowledgeBase()
-  .then(() => {
-    console.log("📚 Knowledge Base loaded, starting bot...");
+  .then((kb) => {
+    console.log("📚 Knowledge Base loaded, setting cache...");
+    setKnowledgeBase(kb);
+    console.log("✅ AI system ready, starting bot...");
     return startBot();
   })
   .catch((err) => {

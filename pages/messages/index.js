@@ -7,10 +7,6 @@ export default function Messages() {
   
   const messages = [
     { id: 1, from: 'John Doe', message: 'Halo, bagaimana cara mendaftar?', unread: true, date: '10:30' },
-    { id: 2, from: 'Jane Smith', message: 'Terima kasih informasinya!', unread: false, date: '09:15' },
-    { id: 3, from: 'Budi Santoso', message: 'Apakah masih ada kuota pendaftaran?', unread: true, date: 'Kemarin' },
-    { id: 4, from: 'Siti Rahayu', message: 'Saya sudah mengisi formulir', unread: false, date: 'Kemarin' },
-    { id: 5, from: 'Ahmad Fauzi', message: 'Berapa biaya pendaftarannya?', unread: false, date: 'Senin' },
   ];
 
   const filteredMessages = activeTab === 'all' 

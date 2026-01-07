@@ -7,10 +7,6 @@ export default function Students() {
   
   const students = [
     { id: 1, name: 'John Doe', email: 'john@example.com', phone: '081234567890', status: 'Diterima', registrationDate: '2023-11-20' },
-    { id: 2, name: 'Jane Smith', email: 'jane@example.com', phone: '081234567891', status: 'Proses', registrationDate: '2023-11-19' },
-    { id: 3, name: 'Budi Santoso', email: 'budi@example.com', phone: '081234567892', status: 'Ditolak', registrationDate: '2023-11-18' },
-    { id: 4, name: 'Siti Rahayu', email: 'siti@example.com', phone: '081234567893', status: 'Diterima', registrationDate: '2023-11-17' },
-    { id: 5, name: 'Ahmad Fauzi', email: 'ahmad@example.com', phone: '081234567894', status: 'Proses', registrationDate: '2023-11-16' },
   ];
 
   const filteredStudents = students.filter(student =>
